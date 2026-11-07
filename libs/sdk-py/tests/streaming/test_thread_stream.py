@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import re
 import uuid
+import weakref
 from typing import Any, cast
 
 import httpx
@@ -20,6 +22,7 @@ from langgraph_sdk.stream.transport import (
     ProtocolSseTransport,
     ProtocolWebSocketTransport,
 )
+from langgraph_sdk.stream.transport.base import EventStreamHandle
 from streaming._events import (
     checkpoints_event,
     custom_event,
@@ -1180,3 +1183,68 @@ async def test_interleave_projections_data_channel_scoped_to_root_namespace():
                     checkpoints.append(item)
     assert {"scope": "root"} in checkpoints
     assert {"scope": "child"} not in checkpoints
+
+
+async def test_completed_events_handles_are_not_retained():
+    """Every finished `thread.events` subscription must be released, and
+    `close()` must drop the handles of subscriptions whose iterators were
+    never drained, even when one of them fails to close (#9620).
+
+    Reproduces the report: 1000 completed subscriptions used to stay in
+    `_open_handles` for the lifetime of the session object.
+    """
+
+    async def empty_events():
+        if False:
+            yield  # pragma: no cover
+
+    class _HandleSpyTransport:
+        def __init__(self) -> None:
+            self.handles: list[weakref.ref[EventStreamHandle]] = []
+            self.closed: list[int] = []
+            self.opened = 0
+            self.fail_close: set[int] = set()
+
+        def open_event_stream(self, _params: dict[str, Any]) -> EventStreamHandle:
+            loop = asyncio.get_running_loop()
+            index = self.opened
+            self.opened += 1
+
+            async def close_handle() -> None:
+                self.closed.append(index)
+                if index in self.fail_close:
+                    raise RuntimeError("scripted close failure")
+
+            handle = EventStreamHandle(
+                empty_events(), loop.create_future(), loop.create_future(), close_handle
+            )
+            self.handles.append(weakref.ref(handle))
+            return handle
+
+        async def close(self) -> None:
+            pass
+
+    async with httpx.AsyncClient(base_url="http://test") as raw:
+        stream = AsyncThreadStream(
+            http=HttpClient(raw), thread_id="t-1", assistant_id="agent"
+        )
+        async with stream:
+            transport = _HandleSpyTransport()
+            stream._transport = cast("Any", transport)
+            assert stream._open_handles == []
+            for _ in range(1000):
+                async for _event in stream.events:
+                    pass
+            assert stream._open_handles == []
+            # Subscriptions whose iterators were never drained keep their handles
+            # until close(); a close that raises must not strand the rest.
+            pending = [stream.events for _ in range(3)]
+            assert len(stream._open_handles) == 3
+            transport.fail_close = {1001}
+            await stream.close()
+            assert stream._open_handles == []
+            assert transport.closed == [1000, 1001, 1002]
+            del pending
+        assert stream._open_handles == []
+    gc.collect()
+    assert sum(ref() is not None for ref in transport.handles) == 0

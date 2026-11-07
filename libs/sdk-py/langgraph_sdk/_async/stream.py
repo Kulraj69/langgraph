@@ -1299,15 +1299,36 @@ class AsyncThreadStream:
             raise RuntimeError("AsyncThreadStream not entered — use `async with`.")
         handle = self._transport.open_event_stream({"channels": _ALL_CHANNELS})
         self._open_handles.append(handle)
-        return handle.events
+        return self._iter_handle(handle)
+
+    async def _iter_handle(self, handle: EventStreamHandle) -> AsyncIterator[Event]:
+        """Yield one handle's events and forget the handle once it ends."""
+        try:
+            async for event in handle.events:
+                yield event
+        finally:
+            self._retire_handle(handle)
+
+    def _retire_handle(self, handle: EventStreamHandle) -> None:
+        """Drop a finished handle so a long-lived session does not retain it.
+
+        Why: `close()` runs once, at teardown, so a session that reads `events`
+        many times would otherwise keep every completed handle alive in
+        `_open_handles` until then. The pump behind an abandoned handle is still
+        cancelled by `transport.close()`, which `close()` calls.
+        """
+        with contextlib.suppress(ValueError):
+            self._open_handles.remove(handle)
 
     async def close(self) -> None:
         """Tear down the thread stream. Idempotent."""
         if self._closed:
             return
         self._closed = True
-        for handle in self._open_handles:
-            await handle.close()
+        for handle in list(self._open_handles):
+            with contextlib.suppress(Exception):
+                await handle.close()
+        self._open_handles.clear()
         # Cancel _run_done so thread.output doesn't wait forever on close.
         run_done = self._run_done
         if run_done is not None and not run_done.done():
